@@ -1,7 +1,7 @@
 @echo off
 cd /d "%~dp0"
 if "%~1"=="" (
-  echo Przeciagnij plik MP4 lub folder na ten plik BAT.
+  echo Drag an MP4 file or folder onto this BAT file.
   pause
   exit /b 1
 )

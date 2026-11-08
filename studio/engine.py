@@ -19,7 +19,7 @@ REVISION = 'f2eee74f4467855ad58fe16f1fb7b7df473263fd'
 
 def gpu():
     if not torch.cuda.is_available():
-        raise RuntimeError('Brak CUDA. Ten panel wymaga karty NVIDIA i PyTorch CUDA.')
+        raise RuntimeError('CUDA is unavailable. NVIDIA GPU and CUDA-enabled PyTorch are required.')
     torch.set_num_threads(min(8, os.cpu_count() or 4))
     torch.backends.cudnn.benchmark = True
 
@@ -77,15 +77,30 @@ def adapters(model):
     return {name: p for name, p in model.named_parameters() if p.requires_grad}
 
 
+def load_transcriber():
+    from transformers import pipeline
+    return pipeline('automatic-speech-recognition',
+                    model=os.environ.get('STUDIO_STT_MODEL', 'openai/whisper-small.en'),
+                    device=0, dtype=torch.float16)
+
+
+def recognize(transcriber, audio):
+    model_name = os.environ.get('STUDIO_STT_MODEL', 'openai/whisper-small.en')
+    # English-only checkpoints reject multilingual language/task arguments.
+    kwargs = {} if model_name.endswith('.en') else {'language': 'en', 'task': 'transcribe'}
+    return transcriber(audio, generate_kwargs=kwargs)['text'].strip()
+
+
 def prepare(report, stopped, **_):
     gpu()
     import librosa
-    from transformers import pipeline
     sources = sorted((DATA / 'samples').glob('*.wav'))
     if not sources:
-        raise ValueError('Najpierw dodaj nagrania.')
+        raise ValueError('Upload recordings first.')
     pending = []
     for source in sources:
+        if (DATA / 'subtitles' / (source.stem + '.json')).exists():
+            continue  # User-supplied timed text is authoritative; never overwrite it with ASR.
         # Stream long recordings in bounded chunks rather than loading hours into RAM.
         with sf.SoundFile(source) as audio:
             segment = 12 * audio.samplerate
@@ -102,21 +117,49 @@ def prepare(report, stopped, **_):
                 sf.write(dest, wav, audio.samplerate, subtype='PCM_16')
                 pending.append((dest, meta, len(wav) / audio.samplerate))
     if pending:
-        report('Ładowanie rozpoznawania mowy na GPU…')
-        transcriber = pipeline('automatic-speech-recognition', model='openai/whisper-small',
-                               device=0, dtype=torch.float16)
+        report('Loading English speech recognition on GPU...')
+        transcriber = load_transcriber()
         for i, (wav, meta, seconds) in enumerate(pending):
             if stopped():
                 return
             audio, _ = librosa.load(wav, sr=16000)
-            text = transcriber(audio, generate_kwargs={'language': 'pl', 'task': 'transcribe'})['text'].strip()
+            text = recognize(transcriber, audio)
             if text:
                 write(meta, {'id': wav.stem, 'text': text, 'seconds': seconds, 'enabled': True})
-            report(f'Transkrypcja {i + 1}/{len(pending)}', progress=(i + 1) / len(pending))
+            report(f'Transcribing {i + 1}/{len(pending)}', progress=(i + 1) / len(pending))
         del transcriber
         gc.collect()
         torch.cuda.empty_cache()
-    report('Próbki przygotowane. Sprawdź rozpoznany tekst przed treningiem.', progress=1)
+    report('Clips prepared. Review transcripts before training.', progress=1)
+
+
+def check_subtitles(report, stopped, sample_id='', **_):
+    """Compare supplied timed text against ASR; never replace the supplied transcript."""
+    gpu()
+    import librosa
+    from .subtitles import word_error
+    from .management import safe_key
+    safe_key(sample_id)
+    selected = [p for p in clips() if read(p).get('sample_id') == sample_id and read(p).get('source') == 'srt']
+    if not selected:
+        raise ValueError('No subtitle clips found for this recording.')
+    report('Loading English speech recognition for subtitle checking…')
+    transcriber = load_transcriber()
+    for i, path in enumerate(selected):
+        if stopped():
+            return
+        row = read(path)
+        audio, _ = librosa.load(path.with_suffix('.wav'), sr=16000)
+        hypothesis = recognize(transcriber, audio)
+        error = word_error(row['text'], hypothesis)
+        row['check'] = {'recognized': hypothesis, 'word_error': error,
+                        'model': os.environ.get('STUDIO_STT_MODEL', 'openai/whisper-small.en')}
+        row['review'] = 'match' if error <= .25 else 'needs_review'
+        # A mismatch is excluded until manually reviewed; ASR agreement isn't proof of accuracy.
+        row['enabled'] = error <= .25
+        write(path, row)
+        report(f'Subtitle check {i + 1}/{len(selected)} · word error {error:.0%}', progress=(i + 1) / len(selected))
+    report('Subtitle check complete. Review flagged clips before training.', progress=1)
 
 
 def features(report, stopped):
@@ -124,10 +167,10 @@ def features(report, stopped):
     from kittenml.kittentts2.speaker import SpeakerEncoder
     records = [read(p) for p in clips() if read(p).get('enabled', True)]
     if len(records) < 2:
-        raise ValueError('Potrzeba minimum dwóch przygotowanych fragmentów. Zalecane: 20–60 minut czystej mowy.')
+        raise ValueError('At least two enabled clips are required. Aim for 20-60 minutes of clean speech.')
     missing = [r for r in records if not (DATA / 'features' / (r['id'] + '.pt')).exists()]
     if missing:
-        report('Kodowanie nowych próbek na GPU…')
+        report('Encoding new clips on GPU...')
         repo, config = repository()
         codec = S3Codec(device='cuda')
         speaker = SpeakerEncoder(Path(repo) / config['speaker_embedding'], device='cuda')
@@ -137,7 +180,7 @@ def features(report, stopped):
             wav = DATA / 'clips' / (row['id'] + '.wav')
             values = {'tokens': codec.encode_reference(wav), 'embedding': torch.tensor(speaker(wav))}
             torch.save(values, DATA / 'features' / (row['id'] + '.pt'))
-            report(f'Kodowanie {i + 1}/{len(missing)}')
+            report(f'Encoding {i + 1}/{len(missing)}')
         del codec, speaker
         gc.collect()
         torch.cuda.empty_cache()
@@ -160,7 +203,7 @@ def train(report, stopped, epochs=3, accumulation=4, lr=0.0001, batch_size=1, **
     if parallel.should_stop(stopped):
         return
     torch.manual_seed(42)  # Feature extraction on rank 0 must not change LoRA initialization.
-    report('Ładowanie modelu do treningu…')
+    report('Loading training model...')
     tts = load_model(training=True)
     model = tts.model
     params = adapters(model)
@@ -174,7 +217,7 @@ def train(report, stopped, epochs=3, accumulation=4, lr=0.0001, batch_size=1, **
     if checkpoint.exists():
         previous = torch.load(checkpoint, map_location='cpu', weights_only=True)
         if previous['base'] != BASE or previous['weights'] != 'emb4' or previous['revision'] != REVISION:
-            raise ValueError('Niezgodna baza zapisanego modelu.')
+            raise ValueError('Checkpoint base model does not match.')
         for name, value in previous['adapter'].items():
             params[name].data.copy_(value)
         optimizer.load_state_dict(previous['optimizer'])
@@ -194,7 +237,7 @@ def train(report, stopped, epochs=3, accumulation=4, lr=0.0001, batch_size=1, **
         prompt = build_generation_prompt(tm, tts.tokenizer.encode(row['text'], add_special_tokens=False))
         target = [tm.audio_id_base + t for t in feature['tokens']] + [tm.speech_end_id]
         if len(prompt) + len(target) > 1024:
-            raise ValueError(f"Zbyt długi fragment: {row['id']}. Skróć tekst lub wyłącz fragment.")
+            raise ValueError(f"Clip is too long: {row['id']}. Shorten the transcript or disable this clip.")
         examples.append((prompt, target, feature['embedding']))
         embeddings.append(feature['embedding'])
     voice_embedding = torch.stack(embeddings).mean(0)
@@ -224,7 +267,7 @@ def train(report, stopped, epochs=3, accumulation=4, lr=0.0001, batch_size=1, **
     training = [i for i in indices if split[records[i]['id']] == 'train']
     holdout = [i for i in indices if split[records[i]['id']] == 'validation']
     if not training:
-        raise ValueError('Włącz przynajmniej jeden fragment ze zbioru treningowego.')
+        raise ValueError('Enable at least one training clip.')
     if parallel.rank() == 0:
         write(split_path, split)
 
@@ -270,11 +313,11 @@ def train(report, stopped, epochs=3, accumulation=4, lr=0.0001, batch_size=1, **
             optimizer.zero_grad(set_to_none=True)
             total = 0.
             for micro, batch in enumerate(batches):
-                report(f'Epoka {epoch + 1}/{epochs} · próbka {offset + micro + 1}/{len(training)} · zapisane kroki {step}',
+                report(f'Epoch {epoch + 1}/{epochs} · batch {offset + micro + 1}/{len(training)} · saved steps {step}',
                        progress=(epoch + (offset + micro) / len(training)) / epochs)
                 loss = loss_for(batch)
                 if not torch.isfinite(loss):
-                    raise RuntimeError('Niestabilny trening. Ostatni poprawny zapis pozostał bez zmian.')
+                    raise RuntimeError('Training became unstable. The last completed checkpoint is preserved.')
                 total += loss.item()
                 scaler.scale(loss / len(batches)).backward()
             scaler.unscale_(optimizer)
@@ -285,7 +328,7 @@ def train(report, stopped, epochs=3, accumulation=4, lr=0.0001, batch_size=1, **
             scaler.update()
             if scaler.get_scale() >= old_scale:
                 step += 1
-            report(f'Epoka {epoch + 1}/{epochs} · krok {step} · błąd {total / len(batches):.4f} · GPU {parallel.world()}',
+            report(f'Epoch {epoch + 1}/{epochs} · step {step} · loss {total / len(batches):.4f} · GPU {parallel.world()}',
                    progress=(epoch + min(1, (offset + accumulation * batch_size * parallel.world()) / len(training))) / epochs,
                    loss=total / len(batches), step=step)
             if step and step % 25 == 0:
@@ -295,7 +338,7 @@ def train(report, stopped, epochs=3, accumulation=4, lr=0.0001, batch_size=1, **
             model.eval()
             with torch.no_grad():
                 validation = sum(loss_for([i]).item() for i in holdout) / len(holdout)
-            report(f'Walidacja po epoce {epoch + 1}: {validation:.4f}', validation_loss=validation)
+            report(f'Validation after epoch {epoch + 1}: {validation:.4f}', validation_loss=validation)
             if math.isfinite(validation) and validation < best_loss:
                 best_loss = validation
                 save(completed_epochs + epoch + 1)
@@ -304,15 +347,15 @@ def train(report, stopped, epochs=3, accumulation=4, lr=0.0001, batch_size=1, **
                 os.replace(temp_best, DATA / 'models' / 'best.pt')
             model.train()
         parallel.barrier()
-    report('Model zapisany. Możesz generować mowę lub dotrenować go później.', progress=1)
+    report('Model saved. Generate speech or continue training later.', progress=1)
 
 
 def generate(report, stopped, text='', **_):
     gpu()
     checkpoint = DATA / 'models' / 'latest.pt'
     if not checkpoint.exists():
-        raise ValueError('Najpierw wytrenuj model.')
-    report('Ładowanie zapisanego modelu…')
+        raise ValueError('Train a model first.')
+    report('Loading saved model...')
     tts = load_model()
     params = adapters(tts.model)
     saved = torch.load(checkpoint, map_location='cpu', weights_only=True)
@@ -326,11 +369,11 @@ def generate(report, stopped, text='', **_):
     del saved
     if stopped():
         return
-    report('Generowanie mowy na GPU…')
+    report('Generating speech on GPU...')
     audio = tts.generate(text, voice='local', use_reference_prompt=False, max_new_tokens=1000)
     if audio is None or len(audio) == 0 or not np.isfinite(audio).all():
-        raise RuntimeError('Model nie wygenerował poprawnego dźwięku.')
+        raise RuntimeError('The model did not generate valid audio.')
     import uuid
     name = f'{uuid.uuid4().hex[:12]}.wav'
     sf.write(DATA / 'outputs' / name, audio, tts.sample_rate)
-    report('Nagranie gotowe.', progress=1, output=name)
+    report('Audio is ready.', progress=1, output=name)

@@ -6,11 +6,11 @@ from .media import convert
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Zaimportuj lokalne nagrania lub folder do panelu.')
+    parser = argparse.ArgumentParser(description='Import local recordings or a folder into the studio.')
     parser.add_argument('source', type=Path)
     args = parser.parse_args()
     if busy():
-        parser.error('Najpierw zatrzymaj bieżące zadanie w panelu.')
+        parser.error('Stop the current studio job first.')
     from .locking import acquire
     compute_lock = acquire()
     paths = sorted(args.source.rglob('*')) if args.source.is_dir() else [args.source]
@@ -21,7 +21,7 @@ def main():
         with tempfile.TemporaryDirectory() as temp:
             wav = convert(path, Path(temp) / 'decoded.wav')
             row = import_sample(wav, path.name)
-            print(f"Dodano {path.name}: {row['seconds']:.1f} s")
+            print(f"Imported {path.name}: {row['seconds']:.1f} s")
 
 
 if __name__ == '__main__':

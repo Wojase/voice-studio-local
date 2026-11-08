@@ -19,6 +19,6 @@ def acquire():
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         handle.close()
-        raise RuntimeError('Inny proces już pracuje na tych danych. Zatrzymaj go przed uruchomieniem kolejnego.')
+        raise RuntimeError('Another process is using this dataset. Stop it before starting another job.')
     atexit.register(handle.close)
     return handle

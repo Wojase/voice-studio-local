@@ -19,7 +19,7 @@ def main():
     action = args.pop('action')
     if action == 'train' and (not 1 <= args['batch_size'] <= 32 or not 1 <= args['epochs'] <= 100
                               or not 1 <= args['accumulation'] <= 32 or not 1e-6 <= args['lr'] <= .001):
-        parser.error('Niepoprawne ustawienia treningu.')
+        parser.error('Invalid training settings.')
     parallel.initialize()
     if parallel.rank() == 0:
         from .locking import acquire
@@ -35,7 +35,7 @@ def main():
         if parallel.rank() == 0:
             print(message, fields, flush=True)
     if parallel.world() > 1 and action != 'train':
-        parser.error('Wiele GPU jest przeznaczone do treningu. Przygotowanie i generowanie uruchom jednym procesem.')
+        parser.error('Multiple GPUs are supported for training. Run preparation and generation as a single process.')
     getattr(engine, action)(report, lambda: stop, **args)
 
 

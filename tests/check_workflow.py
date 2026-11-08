@@ -39,7 +39,7 @@ post('jobs', {'action': 'train', 'epochs': 1, 'accumulation': 1, 'lr': .00005})
 after = wait(stop_after=before + 1)
 assert after['model']['steps'] > before
 print(f"PASS: resume {before} -> {after['model']['steps']}, stop saved", flush=True)
-post('jobs', {'action': 'generate', 'text': 'Dzień dobry. To jest próba mojego lokalnego modelu głosu.'})
+post('jobs', {'action': 'generate', 'text': 'Hello. This is a test of my local voice model.'})
 result = wait()
 assert result['model']['steps'] == after['model']['steps'], 'Generation must not train'
 path = DATA / 'outputs' / result['job']['output']

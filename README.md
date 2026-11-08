@@ -1,43 +1,69 @@
-# Studio głosu — lokalny model na GPU
+# Voice Studio
 
-**Linux / wynajęta maszyna 2× RTX 3090: [pełna instrukcja i komendy](RENTAL.md).**
+English voice-training studio with a browser panel, saved LoRA checkpoints, multi-GPU training, video conversion, timed subtitles and data management.
 
-W panelu można dodawać MP4: automatycznie powstaje MP3 do pobrania oraz WAV do treningu. Samodzielna konwersja pliku lub całego folderu: `python -m studio.media SCIEZKA --output converted`. Windows: przeciągnij film lub folder na `MP4_NA_MP3.bat`. Wymagany FFmpeg w PATH.
+## Quick start
 
-Uruchom **START.bat**, a następnie otwórz http://127.0.0.1:7860.
+Windows: run `START.bat`. Keep the existing CUDA-enabled `.venv`.
 
-1. Dodaj wiele nagrań jednego głosu. Obsługiwane WAV, FLAC, MP3 i OGG, zależnie od kodeków libsndfile.
-2. Kliknij „Przygotuj próbki”. Program dzieli nagrania na fragmenty do 12 s i rozpoznaje polski tekst przez Whisper na GPU. Sprawdź transkrypcje; wyłącz błędne fragmenty. Cięcia mogą wypaść w środku słowa — takie fragmenty najlepiej wyłączyć.
-3. Wytrenuj model. Kolejne uruchomienie treningu wczytuje poprzednie wagi adapterów, stan optymalizatora i skalowania gradientów. Dodanie próbek nie zeruje modelu. Każdy trening obejmuje wszystkie aktywne fragmenty, także wcześniejsze.
-4. Generuj mowę z zapisanego modelu. Nie trzeba ponownie przesyłać próbek ani trenować.
+Linux / Vast.ai: see [RENTAL.md](RENTAL.md). Server controls:
 
-## Co jest zapisywane
+```bash
+bash scripts/server.sh start
+bash scripts/server.sh status
+bash scripts/server.sh logs
+bash scripts/server.sh stop
+bash scripts/server.sh restart
+```
 
-- `data/samples`: nagrania wejściowe mono i metadane; duplikaty są rozpoznawane po zawartości pliku.
-- `data/clips`: fragmenty i poprawialne transkrypcje.
-- `data/features`: jednorazowo obliczone tokeny dźwięku i cechy głosu.
-- `data/models/latest.pt`: rzeczywiste wytrenowane adaptery LoRA, optymalizator, liczba kroków, uśredniona reprezentacja głosu. Do działania potrzebna jest również baza KittenTTS2 z lokalnego cache Hugging Face.
-- `data/models/reference.wav`: stała referencja dekodera dźwięku. Nie jest ponownie przesyłana przez użytkownika.
-- `data/outputs`: gotowe WAV.
-- `data/jobs`: statusy i dzienniki zadań.
-- `archive`: zachowane wcześniejsze skrypty i ich wyniki. Oryginalne WAV są zachowane w `archive/originals` oraz zaimportowane do panelu.
+Stop waits for the current job to finish its update and save before shutting down the panel. It refuses to terminate unrelated programs using port 7860. The rental profile binds `0.0.0.0:7860`, uses two GPUs for training and Whisper large-v3 for English STT. Expose it through your controlled Vast.ai tunnel; the application itself has no user authentication.
 
-## Trening i ograniczenia
+## Workflow
 
-To własny eksperymentalny trainer LoRA dla KittenTTS2 0.9.4, nie oficjalny trainer producenta. Uczy projekcje Q/V uwagi na tokenach prawdziwych nagrań z transkrypcją; baza i dekoder pozostają zamrożone. Generator używa tych samych adapterów i tego samego formatu warunkowania głosem co trening. Jakość trzeba oceniać odsłuchem. Kilkadziesiąt sekund wystarczy do testu działania, nie do oceny jakości głosu.
+1. Upload clean recordings of one speaker. MP4/MOV/MKV creates MP3 for download and WAV for training.
+2. Either prepare clips with English STT, or select a recording and import its matching UTF-8 SRT.
+3. Review text and audio, enable good clips, then train.
+4. Generate new sentences from the saved model. Later training resumes weights and optimizer.
 
-BF16, CUDA, akumulacja gradientów i opcjonalny checkpointing aktywacji. Model wymaga zakresu BF16 — test rzeczywistego fragmentu wykazał przepełnienie FP16 w projekcji uwagi warstwy 23. RTX 2070 nie ma natywnego przyspieszenia BF16, więc obliczenia są wolniejsze niż na RTX 3090. Whisper korzysta z FP16. Domyślny batch na RTX 2070 to jeden fragment; panel pozwala ustawić rzeczywisty batch na GPU oraz akumulację osobno. Profil 2×3090 zaczyna od batcha 4 na kartę. Nie wymuszamy sztucznego obciążenia GPU: przygotowanie danych, zapis i generowanie autoregresyjne nie utrzymują stałych 100%. Zamknięcie innych programów używających GPU zwiększa dostępną pamięć. Błąd braku VRAM jest pokazywany w panelu.
+### Audio + SRT and SRT + check
 
-Zapis atomowy po każdej epoce, co 25 kroków oraz po przycisku zatrzymania (na granicy aktualizacji). Kontynuacja zachowuje uczenie, ale nie odtwarza dokładnie pozycji i kolejności próbek w przerwanej epoce. Nagłe wyłączenie zachowuje ostatni ukończony zapis. Jedno zadanie korzysta z GPU w danej chwili. Modele są zwalniane po zadaniu; generowanie ładuje wagi ponownie, ale ich nie trenuje.
+SRT timestamps must be ordered, non-overlapping, inside the selected audio, and individual cues must not exceed 12 seconds. Subtitle text is paired with precisely those audio ranges. Nearby short cues are grouped into roughly 6-12 second training clips. Long silent gaps are not combined.
 
-Od 10 fragmentów jest wydzielane około 10% na walidację. Mniejszy zestaw nie ma miarodajnego pomiaru generalizacji. Pierwsze uruchomienie może pobrać wagi z Hugging Face; nagrania nie są wysyłane. Zachowaj lokalny cache modeli, aby nie pobierać ich ponownie.
+Importing SRT replaces the selected recording's old clips and feature caches; they are moved to Trash. New subtitle clips start disabled, so unchecked text is not silently used for training. Review and enable them manually, or run **SRT + check with STT**. It transcribes each grouped fragment independently and compares normalized words with the supplied text. Word error above 25% disables the fragment and marks it for review. This threshold is a heuristic, not a confidence guarantee. Check results show what STT heard; your SRT text is never overwritten. Manual review can override automatic exclusion. Checks do not perform forced alignment or prove timestamps or speaker identity. Incorrect transcription, clip boundaries, silence and proper names may produce false flags or false matches.
 
-Powered by KittenML. Baza i jej pochodne podlegają licencji producenta: https://kittenml.com/license/.
+Preparation skips recordings with attached SRT. To start over with automatic STT, use **Delete clips / redo STT** on that recording, then Prepare. Existing old transcripts are not automatically retranscribed when switching STT models.
 
-## Sprawdzenie działania — 8 listopada 2026
+### Manage and delete
 
-Na RTX 2070 przygotowano 18 fragmentów z dwóch istniejących nagrań (łącznie około 3,6 minuty). Trening ukończył 1 epokę i zapisał 5 aktualizacji. Ponowne uruchomienie wczytało zapis, wykonało aktualizacje do kroku 7 i zapisało stan po zatrzymaniu. Generowanie z tego modelu utworzyło WAV 24 kHz o długości 3,36 s, bez zmiany liczby kroków treningu. Zaobserwowane obciążenie podczas treningu: 97–98%, pamięć około 6,5 GB. To test działania, nie potwierdzenie jakości ani podobieństwa głosu.
+Delete individual recordings, clips, outputs and converted MP3s. Deleting a recording also moves its clips, SRT metadata and feature caches to Trash. Reset just the trained model, just the dataset, or both. Existing trained weights retain information from deleted recordings until you reset and retrain the model.
 
-Testy podstawowe: `.venv\Scripts\python.exe -m unittest discover -s tests -v`.
-Rzeczywisty test gradientów na GPU: `.venv\Scripts\python.exe -m tests.gpu_probe`.
-Pełny test kontynuacji i generowania: `.venv\Scripts\python.exe -m tests.check_workflow` (wymaga uruchomionego panelu i zapisanego modelu; wykonuje dalszy trening i zapisuje wynik).
+Trash is recoverable and still consumes disk space. Restore refuses to overwrite newer files. Permanently removing a Trash entry requires typing `DELETE` in the panel and cannot be undone. Management operations are blocked while a job uses the dataset.
+
+## Models and quality
+
+The TTS base remains pinned KittenTTS2 0.9.4 with custom experimental Q/V LoRA training. A stronger STT model improves transcription, not the capacity or naturalness of the TTS base. ElevenLabs-level quality is not guaranteed. Evaluate with clean held-out sentences and listening tests.
+
+Local default: `openai/whisper-small.en`. Rental default: `openai/whisper-large-v3`. Override with `STUDIO_STT_MODEL`; recognition is explicitly English. Models download on first use and run on the server. Uploaded audio and subtitles are not sent to a transcription service.
+
+Training uses BF16 because FP16 overflowed on a real sample. Per-GPU batch and gradient accumulation are separate settings. Linux multi-GPU training synchronizes adapter gradients through NCCL. Preparation/checking and a single generated recording run on one GPU. Two 24 GB GPUs are separate memory pools. Constant 100% utilization is not guaranteed.
+
+## Data and checkpoints
+
+Everything private is under ignored `data/` (or `STUDIO_DATA`). Keep `samples`, `clips`, `features`, `subtitles` and the complete `models` folder when migrating machines. `models/latest.pt` resumes training; `best.pt` retains the lowest observed validation loss. Generation currently uses `latest.pt`. The base-model cache is also required, or will download again.
+
+Checkpoints save every 25 updates, after epochs, and on graceful stop. Resume preserves weights and optimizer, but starts an interrupted epoch again. Validation membership persists in `models/split.json`; it is a clip-level split, so clips from the same recording may appear in both partitions. Validation scores are not independent recording-level quality measurements.
+
+## Tools and tests
+
+```bash
+python -m studio.media /path/to/videos --output /path/to/mp3
+python -m studio.importer /path/to/recordings
+python -m studio.cli prepare
+python -m unittest discover -s tests -v
+```
+
+Windows conversion: drag a video or folder onto `MP4_NA_MP3.bat`. FFmpeg must be in PATH. Conversion never overwrites originals.
+
+Tests cover real FFmpeg conversion, upload, gradient learning, data sharding, SRT validation and audio cuts, STT-check logic using a mocked recognizer, and delete/restore/purge behavior. The real user-provided SRT was parsed locally without publishing it. Actual English large-v3 inference and full two-RTX-3090 throughput still require verification on the rental machine.
+
+Powered by KittenML. Application code is MIT; base model and derived adapters retain the [KittenML model license](https://kittenml.com/license/).

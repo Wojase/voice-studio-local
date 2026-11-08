@@ -34,10 +34,10 @@ def busy():
 
 @app.before_request
 def local_only():
-    if request.host.split(':')[0] not in ('127.0.0.1', 'localhost'):
-        return jsonify(error='Niedozwolony adres.'), 403
+    if request.host.split(':')[0] not in ('127.0.0.1', 'localhost') and os.environ.get('STUDIO_PUBLIC', '0') != '1':
+        return jsonify(error='Host is not allowed.'), 403
     if request.method != 'GET' and request.headers.get('X-Studio') != 'local':
-        return jsonify(error='Otwórz panel lokalny, aby wykonać tę operację.'), 403
+        return jsonify(error='Open the studio to perform this action.'), 403
 
 
 @app.errorhandler(Exception)
@@ -57,9 +57,12 @@ def status():
     if job and job['status'] == 'running' and not busy():
         job = read(DATA / 'jobs' / f'{active}.json')
         if job['status'] == 'running':
-            job.update(status='error', message='Proces zakończył się nieoczekiwanie. Sprawdź dziennik w data/jobs.')
+            job.update(status='error', message='The worker exited unexpectedly. Check its log in data/jobs.')
     return jsonify(job=job, busy=busy(), model=read(DATA / 'models' / 'info.json'),
                    settings={'batch_size': int(os.environ.get('STUDIO_BATCH_SIZE', '1')), 'gpus': int(os.environ.get('STUDIO_GPUS', '1'))},
+                   stt={'model': os.environ.get('STUDIO_STT_MODEL', 'openai/whisper-small.en'), 'language': 'en'},
+                   trash=[read(p) for p in (DATA / 'trash').glob('*/manifest.json')],
+                   subtitles=[read(p) for p in (DATA / 'subtitles').glob('*.json')],
                    converted=[p.name for p in sorted((DATA / 'converted').glob('*.mp3'))],
                    samples=[read(p) for p in sorted((DATA / 'samples').glob('*.json'))],
                    clips=[read(p) for p in clips()],
@@ -72,7 +75,7 @@ def gpu():
                              '--format=csv,noheader,nounits'], capture_output=True, text=True,
                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), timeout=5)
     if result.returncode:
-        return jsonify(error='Nie można odczytać GPU.'), 503
+        return jsonify(error='GPU status is unavailable.'), 503
     cards = []
     for line in result.stdout.splitlines():
         values = [v.strip() for v in line.split(',')]
@@ -90,7 +93,7 @@ def import_sample(source, original):
     # Decode before accepting: the extension alone does not establish an audio file.
     with sf.SoundFile(source) as incoming:
         if incoming.frames < incoming.samplerate * 2:
-            raise ValueError('Nagranie musi mieć przynajmniej 2 sekundy.')
+            raise ValueError('Recordings must be at least 2 seconds long.')
         with sf.SoundFile(dest, 'w', samplerate=incoming.samplerate, channels=1, subtype='PCM_16') as out:
             for block in incoming.blocks(blocksize=65536, dtype='float32', always_2d=True):
                 out.write(block.mean(axis=1))
@@ -103,7 +106,7 @@ def import_sample(source, original):
 def upload():
     with lock:
         if busy():
-            return jsonify(error='Poczekaj na zakończenie bieżącego zadania.'), 409
+            return jsonify(error='Wait for the current job to finish.'), 409
         file = request.files['file']
         temp = DATA / 'samples' / (uuid.uuid4().hex + '.upload')
         try:
@@ -132,16 +135,18 @@ def upload():
 def edit_clip(key):
     with lock:
         if busy():
-            return jsonify(error='Nie można zmieniać próbek podczas pracy.'), 409
+            return jsonify(error='Stop the current job before editing clips.'), 409
         path = DATA / 'clips' / f'{key}.json'
         if not path.exists():
-            return jsonify(error='Nie ma takiego fragmentu.'), 404
+            return jsonify(error='Clip not found.'), 404
         payload = request.get_json()
         text = str(payload.get('text', '')).strip()
         if not text or len(text) > 2000:
-            raise ValueError('Tekst fragmentu musi mieć 1–2000 znaków.')
+            raise ValueError('Clip text must contain 1-2000 characters.')
         row = read(path)
         row.update(text=text, enabled=bool(payload.get('enabled', True)))
+        if row.get('source') == 'srt':
+            row['review'] = 'manual'
         write(path, row)
         return jsonify(row)
 
@@ -151,32 +156,37 @@ def start():
     global active, process
     with lock:
         if busy():
-            return jsonify(error='Jedno zadanie już korzysta z GPU.'), 409
+            return jsonify(error='A job is already using the GPU.'), 409
         payload = request.get_json()
         action = payload.get('action')
-        if action not in ('prepare', 'train', 'generate'):
-            raise ValueError('Nieznane zadanie.')
+        if action not in ('prepare', 'train', 'generate', 'check_subtitles'):
+            raise ValueError('Unknown job.')
         args = {}
+        if action == 'check_subtitles':
+            from studio.management import safe_key
+            args['sample_id'] = safe_key(payload.get('sample_id'))
+            if not (DATA / 'subtitles' / (args['sample_id'] + '.json')).exists():
+                raise ValueError('Attach an SRT file to this recording first.')
         if action == 'train':
             args = {'epochs': int(payload.get('epochs', 3)), 'accumulation': int(payload.get('accumulation', 4)),
                     'lr': float(payload.get('lr', .0001)), 'batch_size': int(payload.get('batch_size', os.environ.get('STUDIO_BATCH_SIZE', '1')))}
             if not 1 <= args['epochs'] <= 100 or not 1 <= args['accumulation'] <= 32 or not 1e-6 <= args['lr'] <= 1e-3:
-                raise ValueError('Niepoprawne ustawienia treningu.')
+                raise ValueError('Invalid training settings.')
             if not 1 <= args['batch_size'] <= 32:
-                raise ValueError('Batch musi mieć od 1 do 32 próbek na GPU.')
+                raise ValueError('Batch size must be between 1 and 32 per GPU.')
         if action == 'generate':
             args['text'] = str(payload.get('text', '')).strip()
             if not 1 <= len(args['text']) <= 3000:
-                raise ValueError('Podaj od 1 do 3000 znaków.')
+                raise ValueError('Enter 1-3000 characters.')
         active = uuid.uuid4().hex
         write(DATA / 'jobs' / f'{active}.json', {'id': active, 'action': action, 'args': args,
-                                               'status': 'running', 'message': 'Uruchamianie…', 'progress': 0})
+                                               'status': 'running', 'message': 'Starting...', 'progress': 0})
         with open(DATA / 'jobs' / f'{active}.log', 'w', encoding='utf-8') as log:
             count = int(os.environ.get('STUDIO_GPUS', '1')) if action == 'train' else 1
             command = [sys.executable, '-X', 'utf8', '-m', 'studio.worker', active]
             if count > 1:
                 if sys.platform == 'win32':
-                    raise ValueError('Trening na wielu GPU wymaga Linuksa z NCCL.')
+                    raise ValueError('Multi-GPU training requires Linux with NCCL.')
                 command = [sys.executable, '-m', 'torch.distributed.run', '--standalone',
                            f'--nproc_per_node={count}', '--module', 'studio.worker', active]
             process = subprocess.Popen(command, cwd=ROOT,
@@ -189,7 +199,7 @@ def stop():
     with lock:
         if busy():
             (DATA / 'jobs' / f'{active}.stop').touch()
-    return jsonify(message='Zatrzymanie po bieżącym kroku; zapis treningu może chwilę potrwać.')
+    return jsonify(message='Stopping after the current update. Saving may take a moment.')
 
 
 @app.get('/audio/<kind>/<name>')
@@ -197,6 +207,81 @@ def audio(kind, name):
     if kind not in ('clips', 'outputs', 'samples', 'converted') or not name.endswith(('.wav', '.mp3')):
         return '', 404
     return send_from_directory(DATA / kind, name)
+
+
+@app.post('/api/manage')
+def manage():
+    from studio import management
+    from studio.locking import acquire
+    with lock:
+        if busy():
+            return jsonify(error='Stop the current job before changing data.'), 409
+        body = request.get_json()
+        with acquire():
+            if body.get('action') == 'purge':
+                if body.get('confirm') != 'DELETE':
+                    raise ValueError('Permanent deletion requires typing DELETE.')
+                management.purge(body.get('key', ''))
+                return jsonify(deleted=True)
+            if body.get('action') == 'restore':
+                return jsonify(management.restore(body.get('key', '')))
+            paths = management.collect(body.get('kind'), body.get('key', ''))
+            return jsonify(management.trash(paths, body.get('kind') + ': ' + body.get('key', 'all')))
+
+
+@app.post('/api/subtitles/<sample_id>')
+def attach_subtitles(sample_id):
+    import tempfile
+    from studio.subtitles import parse, grouped
+    from studio import management
+    from studio.locking import acquire
+    management.safe_key(sample_id)
+    with lock:
+        if busy():
+            return jsonify(error='Stop the current job before importing subtitles.'), 409
+        with acquire():
+            source = DATA / 'samples' / (sample_id + '.wav')
+            if not source.is_file():
+                return jsonify(error='Recording not found.'), 404
+            content = request.files['file'].stream.read(5 * 1024 * 1024 + 1)
+            if len(content) > 5 * 1024 * 1024:
+                raise ValueError('SRT files must be smaller than 5 MB.')
+            text = content.decode('utf-8-sig')
+            rows = parse(text, sf.info(source).duration)
+            segments = grouped(rows)
+            fingerprint = hashlib.sha256(content).hexdigest()[:10]
+            with tempfile.TemporaryDirectory(dir=DATA) as temp:
+                staged = Path(temp)
+                with sf.SoundFile(source) as incoming:
+                    for i, row in enumerate(segments):
+                        key = f'{sample_id}_srt{fingerprint}_{i:05d}'
+                        incoming.seek(round(row['start'] * incoming.samplerate))
+                        audio_data = incoming.read(round((row['end'] - row['start']) * incoming.samplerate))
+                        sf.write(staged / (key + '.wav'), audio_data, incoming.samplerate, subtype='PCM_16')
+                        write(staged / (key + '.json'), dict(row, id=key, sample_id=sample_id,
+                              seconds=len(audio_data) / incoming.samplerate, enabled=False,
+                              source='srt', review='unchecked', check=None))
+                old = list((DATA / 'clips').glob(sample_id + '_*')) + list((DATA / 'features').glob(sample_id + '_*'))
+                old += list((DATA / 'subtitles').glob(sample_id + '.*'))
+                backup = management.trash(old, 'Replace subtitles: ' + sample_id) if old else None
+                installed = []
+                try:
+                    for file in staged.iterdir():
+                        target = DATA / 'clips' / file.name
+                        file.rename(target)
+                        installed.append(target)
+                    (DATA / 'subtitles').mkdir(exist_ok=True)
+                    result = {'sample_id': sample_id, 'filename': Path(request.files['file'].filename).name,
+                              'cues': len(rows), 'clips': len(segments), 'fingerprint': fingerprint}
+                    write(DATA / 'subtitles' / (sample_id + '.json'), result)
+                except Exception:
+                    for file in installed:
+                        file.unlink(missing_ok=True)
+                    (DATA / 'subtitles' / (sample_id + '.json')).unlink(missing_ok=True)
+                    if backup:
+                        management.restore(backup['id'])
+                    raise
+            return jsonify(result)
 
 
 if __name__ == '__main__':
@@ -223,4 +308,4 @@ if __name__ == '__main__':
                     time.sleep(.2)
         threading.Thread(target=open_when_ready, daemon=True).start()
     print('Panel: http://127.0.0.1:7860', flush=True)
-    serve(app, host='127.0.0.1', port=7860, threads=6, max_request_body_size=2 * 1024 ** 3)
+    serve(app, host=os.environ.get('STUDIO_HOST', '127.0.0.1'), port=7860, threads=6, max_request_body_size=2 * 1024 ** 3)

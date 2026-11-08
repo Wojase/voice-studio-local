@@ -29,12 +29,12 @@ def main():
         getattr(engine, job['action'])(report, stopped, **job['args'])
         job['status'] = 'stopped' if stopped() else 'done'
         if stopped():
-            job['message'] = 'Zatrzymano. Zapisany postęp pozostaje dostępny.'
+            job['message'] = 'Stopped. Saved progress remains available.'
     except Exception as exc:
         traceback.print_exc()
         message = str(exc)
         if 'out of memory' in message.lower():
-            message = 'Brak wolnej pamięci GPU. Zamknij inne programy używające karty i spróbuj ponownie. Ostatni ukończony zapis modelu pozostał na dysku.'
+            message = 'GPU memory exhausted. Reduce batch size or close other GPU workloads. The last completed checkpoint remains on disk.'
         job.update(status='error', message=message)
         if parallel.world() > 1:
             if parallel.rank() == 0:

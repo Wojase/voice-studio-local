@@ -18,3 +18,5 @@ DO_NOT_LOOK.p
 converted/
 input/
 *.zip
+*.srt
+*.vtt
