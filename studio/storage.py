@@ -17,7 +17,15 @@ def read(path, default=None):
 def write(path, value):
     temp = path.with_suffix(path.suffix + '.tmp')
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
-    os.replace(temp, path)
+    for attempt in range(20):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            # Windows refuses to replace a file another thread is reading at that instant (e.g. a status poll).
+            if attempt == 19:
+                raise
+            time.sleep(.05)
 
 
 def append_jsonl(path, value):
