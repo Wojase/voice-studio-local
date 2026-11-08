@@ -133,14 +133,14 @@ def prepare(report, stopped, **_):
     report('Clips prepared. Review transcripts before training.', progress=1)
 
 
-def check_subtitles(report, stopped, sample_id='', **_):
+def check_subtitles(report, stopped, sample_id='', sample_ids=None, **_):
     """Compare supplied timed text against ASR; never replace the supplied transcript."""
     gpu()
     import librosa
     from .subtitles import word_error
     from .management import safe_key
-    safe_key(sample_id)
-    selected = [p for p in clips() if read(p).get('sample_id') == sample_id and read(p).get('source') == 'srt']
+    ids = set(safe_key(key) for key in (sample_ids or [sample_id]))
+    selected = [p for p in clips() if read(p).get('sample_id') in ids and read(p).get('source') == 'srt']
     if not selected:
         raise ValueError('No subtitle clips found for this recording.')
     report('Loading English speech recognition for subtitle checking…')

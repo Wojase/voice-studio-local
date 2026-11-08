@@ -104,31 +104,63 @@ def import_sample(source, original):
 
 @app.post('/api/upload')
 def upload():
+    from studio.locking import acquire
+    from studio.media import convert
+    from studio.subtitles import parse
     with lock:
         if busy():
             return jsonify(error='Wait for the current job to finish.'), 409
-        file = request.files['file']
-        temp = DATA / 'samples' / (uuid.uuid4().hex + '.upload')
-        try:
-            file.save(temp)
-            if Path(file.filename).suffix.lower() in ('.mp4', '.m4v', '.mov', '.mkv'):
-                from studio.media import convert
-                converted = DATA / 'converted'
-                converted.mkdir(exist_ok=True)
-                with temp.open('rb') as stream:
-                    key = hashlib.file_digest(stream, 'sha256').hexdigest()[:24]
-                mp3 = converted / (key + '.mp3')
-                if not mp3.exists():
-                    convert(temp, mp3, mp3=True)
-                decoded = temp.with_suffix('.wav')
-                try:
+        with acquire():
+            file = request.files['file']
+            subtitle_file = request.files.get('subtitles')
+            mode = request.form.get('subtitle_mode', 'use')
+            if subtitle_file and mode not in ('use', 'check'):
+                raise ValueError('Choose Use SRT or SRT + check.')
+            temp = DATA / 'samples' / (uuid.uuid4().hex + '.upload')
+            decoded = temp.with_suffix('.wav')
+            new_sample, new_mp3 = None, None
+            try:
+                file.save(temp)
+                video = Path(file.filename).suffix.lower() in ('.mp4', '.m4v', '.mov', '.mkv')
+                source = temp
+                if video:
                     convert(temp, decoded)
-                    return jsonify(import_sample(decoded, Path(file.filename).name))
-                finally:
-                    decoded.unlink(missing_ok=True)
-            return jsonify(import_sample(temp, Path(file.filename).name))
-        finally:
-            temp.unlink(missing_ok=True)
+                    source = decoded
+                # Validate subtitles before publishing any new dataset files.
+                if subtitle_file:
+                    content = subtitle_file.stream.read(5 * 1024 * 1024 + 1)
+                    if len(content) > 5 * 1024 * 1024:
+                        raise ValueError('SRT files must be smaller than 5 MB.')
+                    parse(content.decode('utf-8-sig'), sf.info(source).duration)
+                    subtitle_file.stream.seek(0)
+                if video:
+                    converted = DATA / 'converted'
+                    converted.mkdir(exist_ok=True)
+                    with temp.open('rb') as stream:
+                        key = hashlib.file_digest(stream, 'sha256').hexdigest()[:24]
+                    mp3 = converted / (key + '.mp3')
+                    if not mp3.exists():
+                        convert(temp, mp3, mp3=True)
+                        new_mp3 = mp3
+                with source.open('rb') as stream:
+                    sample_id = hashlib.file_digest(stream, 'sha256').hexdigest()[:24]
+                if not (DATA / 'samples' / (sample_id + '.json')).exists():
+                    new_sample = sample_id
+                result = import_sample(source, Path(file.filename).name)
+                if subtitle_file:
+                    result['subtitles'] = install_subtitles(result['id'], subtitle_file, trusted=mode == 'use')
+                    result['check_requested'] = mode == 'check'
+                return jsonify(result)
+            except Exception:
+                if new_sample:
+                    for suffix in ('.json', '.wav'):
+                        (DATA / 'samples' / (new_sample + suffix)).unlink(missing_ok=True)
+                if new_mp3:
+                    new_mp3.unlink(missing_ok=True)
+                raise
+            finally:
+                temp.unlink(missing_ok=True)
+                decoded.unlink(missing_ok=True)
 
 
 @app.post('/api/clips/<key>')
@@ -164,9 +196,13 @@ def start():
         args = {}
         if action == 'check_subtitles':
             from studio.management import safe_key
-            args['sample_id'] = safe_key(payload.get('sample_id'))
-            if not (DATA / 'subtitles' / (args['sample_id'] + '.json')).exists():
-                raise ValueError('Attach an SRT file to this recording first.')
+            ids = payload.get('sample_ids', [payload.get('sample_id')])
+            if not isinstance(ids, list) or not 1 <= len(ids) <= 500:
+                raise ValueError('Choose 1-500 recordings to check.')
+            args['sample_ids'] = list(dict.fromkeys(safe_key(key) for key in ids))
+            for key in args['sample_ids']:
+                if not (DATA / 'subtitles' / (key + '.json')).exists():
+                    raise ValueError('Attach an SRT file to this recording first.')
         if action == 'train':
             args = {'epochs': int(payload.get('epochs', 3)), 'accumulation': int(payload.get('accumulation', 4)),
                     'lr': float(payload.get('lr', .0001)), 'batch_size': int(payload.get('batch_size', os.environ.get('STUDIO_BATCH_SIZE', '1')))}
@@ -229,59 +265,63 @@ def manage():
             return jsonify(management.trash(paths, body.get('kind') + ': ' + body.get('key', 'all')))
 
 
-@app.post('/api/subtitles/<sample_id>')
-def attach_subtitles(sample_id):
+def install_subtitles(sample_id, subtitle_file, trusted=False):
     import tempfile
     from studio.subtitles import parse, grouped
     from studio import management
-    from studio.locking import acquire
     management.safe_key(sample_id)
+    source = DATA / 'samples' / (sample_id + '.wav')
+    if not source.is_file():
+        raise ValueError('Recording not found.')
+    content = subtitle_file.stream.read(5 * 1024 * 1024 + 1)
+    if len(content) > 5 * 1024 * 1024:
+        raise ValueError('SRT files must be smaller than 5 MB.')
+    text = content.decode('utf-8-sig')
+    rows = parse(text, sf.info(source).duration)
+    segments = grouped(rows)
+    fingerprint = hashlib.sha256(content).hexdigest()[:10]
+    with tempfile.TemporaryDirectory(dir=DATA) as temp:
+        staged = Path(temp)
+        with sf.SoundFile(source) as incoming:
+            for i, row in enumerate(segments):
+                key = f'{sample_id}_srt{fingerprint}_{i:05d}'
+                incoming.seek(round(row['start'] * incoming.samplerate))
+                audio_data = incoming.read(round((row['end'] - row['start']) * incoming.samplerate))
+                sf.write(staged / (key + '.wav'), audio_data, incoming.samplerate, subtype='PCM_16')
+                write(staged / (key + '.json'), dict(row, id=key, sample_id=sample_id,
+                      seconds=len(audio_data) / incoming.samplerate, enabled=trusted,
+                      source='srt', review='provided' if trusted else 'unchecked', check=None))
+        old = list((DATA / 'clips').glob(sample_id + '_*')) + list((DATA / 'features').glob(sample_id + '_*'))
+        old += list((DATA / 'subtitles').glob(sample_id + '.*'))
+        backup = management.trash(old, 'Replace subtitles: ' + sample_id) if old else None
+        installed = []
+        try:
+            for file in staged.iterdir():
+                target = DATA / 'clips' / file.name
+                file.rename(target)
+                installed.append(target)
+            (DATA / 'subtitles').mkdir(exist_ok=True)
+            result = {'sample_id': sample_id, 'filename': Path(subtitle_file.filename).name,
+                      'cues': len(rows), 'clips': len(segments), 'fingerprint': fingerprint}
+            write(DATA / 'subtitles' / (sample_id + '.json'), result)
+        except Exception:
+            for file in installed:
+                file.unlink(missing_ok=True)
+            (DATA / 'subtitles' / (sample_id + '.json')).unlink(missing_ok=True)
+            if backup:
+                management.restore(backup['id'])
+            raise
+    return result
+
+
+@app.post('/api/subtitles/<sample_id>')
+def attach_subtitles(sample_id):
+    from studio.locking import acquire
     with lock:
         if busy():
             return jsonify(error='Stop the current job before importing subtitles.'), 409
         with acquire():
-            source = DATA / 'samples' / (sample_id + '.wav')
-            if not source.is_file():
-                return jsonify(error='Recording not found.'), 404
-            content = request.files['file'].stream.read(5 * 1024 * 1024 + 1)
-            if len(content) > 5 * 1024 * 1024:
-                raise ValueError('SRT files must be smaller than 5 MB.')
-            text = content.decode('utf-8-sig')
-            rows = parse(text, sf.info(source).duration)
-            segments = grouped(rows)
-            fingerprint = hashlib.sha256(content).hexdigest()[:10]
-            with tempfile.TemporaryDirectory(dir=DATA) as temp:
-                staged = Path(temp)
-                with sf.SoundFile(source) as incoming:
-                    for i, row in enumerate(segments):
-                        key = f'{sample_id}_srt{fingerprint}_{i:05d}'
-                        incoming.seek(round(row['start'] * incoming.samplerate))
-                        audio_data = incoming.read(round((row['end'] - row['start']) * incoming.samplerate))
-                        sf.write(staged / (key + '.wav'), audio_data, incoming.samplerate, subtype='PCM_16')
-                        write(staged / (key + '.json'), dict(row, id=key, sample_id=sample_id,
-                              seconds=len(audio_data) / incoming.samplerate, enabled=False,
-                              source='srt', review='unchecked', check=None))
-                old = list((DATA / 'clips').glob(sample_id + '_*')) + list((DATA / 'features').glob(sample_id + '_*'))
-                old += list((DATA / 'subtitles').glob(sample_id + '.*'))
-                backup = management.trash(old, 'Replace subtitles: ' + sample_id) if old else None
-                installed = []
-                try:
-                    for file in staged.iterdir():
-                        target = DATA / 'clips' / file.name
-                        file.rename(target)
-                        installed.append(target)
-                    (DATA / 'subtitles').mkdir(exist_ok=True)
-                    result = {'sample_id': sample_id, 'filename': Path(request.files['file'].filename).name,
-                              'cues': len(rows), 'clips': len(segments), 'fingerprint': fingerprint}
-                    write(DATA / 'subtitles' / (sample_id + '.json'), result)
-                except Exception:
-                    for file in installed:
-                        file.unlink(missing_ok=True)
-                    (DATA / 'subtitles' / (sample_id + '.json')).unlink(missing_ok=True)
-                    if backup:
-                        management.restore(backup['id'])
-                    raise
-            return jsonify(result)
+            return jsonify(install_subtitles(sample_id, request.files['file']))
 
 
 if __name__ == '__main__':

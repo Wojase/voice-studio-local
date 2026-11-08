@@ -14,6 +14,37 @@ SRT = '1\n00:00:00,000 --> 00:00:02,000\nHello world.\n\n2\n00:00:02,100 --> 00:
 
 
 class SubtitleTests(unittest.TestCase):
+    def test_optional_subtitles_in_upload_and_validation_before_publish(self):
+        for mode in ('use', 'check'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                for kind in ('samples', 'clips', 'features', 'models', 'outputs', 'subtitles'):
+                    (root / kind).mkdir()
+                wav = io.BytesIO()
+                sf.write(wav, np.zeros(80000), 16000, format='WAV')
+                raw = wav.getvalue()
+                headers = {'X-Studio': 'local'}
+                with patch('app.DATA', root), patch('studio.management.DATA', root), patch('studio.locking.DATA', root), patch('app.busy', return_value=False):
+                    client = app.test_client()
+                    bad = client.post('/api/upload', data={'file': (io.BytesIO(raw), 'voice.wav'),
+                        'subtitles': (io.BytesIO(b'invalid'), 'voice.srt'), 'subtitle_mode': mode}, headers=headers)
+                    self.assertEqual(bad.status_code, 400)
+                    self.assertEqual(list((root / 'samples').iterdir()), [])
+                    response = client.post('/api/upload', data={'file': (io.BytesIO(raw), 'voice.wav'),
+                        'subtitles': (io.BytesIO(SRT.encode()), 'voice.srt'), 'subtitle_mode': mode}, headers=headers)
+                    self.assertEqual(response.status_code, 200, response.get_json())
+                    result = response.get_json()
+                    self.assertEqual(result['check_requested'], mode == 'check')
+                    clip = next((root / 'clips').glob('*.json'))
+                    self.assertEqual(read(clip)['enabled'], mode == 'use')
+                    self.assertEqual(read(clip)['text'], 'Hello world. This is a test.')
+                    # A bad replacement must preserve the previous valid dataset.
+                    before = clip.read_bytes()
+                    bad = client.post('/api/upload', data={'file': (io.BytesIO(raw), 'voice.wav'),
+                        'subtitles': (io.BytesIO(b'invalid'), 'voice.srt'), 'subtitle_mode': mode}, headers=headers)
+                    self.assertEqual(bad.status_code, 400)
+                    self.assertEqual(clip.read_bytes(), before)
+
     def test_parse_and_group(self):
         rows = parse('\ufeff' + SRT, 5)
         result = grouped(rows)
@@ -56,7 +87,7 @@ class SubtitleTests(unittest.TestCase):
                 def fake_pipeline(*args, **kwargs):
                     return lambda *a, **kw: {'text': 'Hello world. This is a test.'}
                 with patch('studio.engine.DATA', root), patch('studio.storage.DATA', root), patch('studio.engine.gpu'), patch('studio.engine.load_transcriber', side_effect=fake_pipeline):
-                    check_subtitles(lambda *a, **kw: None, lambda: False, sample_id=key)
+                    check_subtitles(lambda *a, **kw: None, lambda: False, sample_ids=[key])
                 self.assertTrue(read(clip)['enabled'])
                 self.assertEqual(read(clip)['text'], expected_text)
                 with patch('studio.engine.DATA', root), patch('studio.storage.DATA', root), patch('studio.engine.gpu'), patch('studio.engine.load_transcriber', return_value=lambda *a, **kw: {'text': 'Completely different words'}):

@@ -20,7 +20,7 @@ Stop waits for the current job to finish its update and save before shutting dow
 
 ## Workflow
 
-1. Upload clean recordings of one speaker. MP4/MOV/MKV creates MP3 for download and WAV for training.
+1. Stage clean recordings of one speaker. Before confirming upload, optionally attach an SRT to each recording and select **Use SRT** (trust and enable text without STT) or **SRT + check** (automatically verify with English STT after upload). Nothing uploads until you click Confirm upload. MP4/MOV/MKV creates MP3 for download and WAV for training.
 2. Either prepare clips with English STT, or select a recording and import its matching UTF-8 SRT.
 3. Review text and audio, enable good clips, then train.
 4. Generate new sentences from the saved model. Later training resumes weights and optimizer.
@@ -29,7 +29,7 @@ Stop waits for the current job to finish its update and save before shutting dow
 
 SRT timestamps must be ordered, non-overlapping, inside the selected audio, and individual cues must not exceed 12 seconds. Subtitle text is paired with precisely those audio ranges. Nearby short cues are grouped into roughly 6-12 second training clips. Long silent gaps are not combined.
 
-Importing SRT replaces the selected recording's old clips and feature caches; they are moved to Trash. New subtitle clips start disabled, so unchecked text is not silently used for training. Review and enable them manually, or run **SRT + check with STT**. It transcribes each grouped fragment independently and compares normalized words with the supplied text. Word error above 25% disables the fragment and marks it for review. This threshold is a heuristic, not a confidence guarantee. Check results show what STT heard; your SRT text is never overwritten. Manual review can override automatic exclusion. Checks do not perform forced alignment or prove timestamps or speaker identity. Incorrect transcription, clip boundaries, silence and proper names may produce false flags or false matches.
+Importing SRT replaces the selected recording's old clips and feature caches; they are moved to Trash. Clips imported through the separate Audio + SRT panel start disabled. In the upload form, **Use SRT** explicitly trusts your supplied text and enables those clips without STT; **SRT + check** keeps them disabled until the check finishes. Review and enable them manually, or run **SRT + check with STT**. It transcribes each grouped fragment independently and compares normalized words with the supplied text. Word error above 25% disables the fragment and marks it for review. This threshold is a heuristic, not a confidence guarantee. Check results show what STT heard; your SRT text is never overwritten. Manual review can override automatic exclusion. Checks do not perform forced alignment or prove timestamps or speaker identity. Incorrect transcription, clip boundaries, silence and proper names may produce false flags or false matches.
 
 Preparation skips recordings with attached SRT. To start over with automatic STT, use **Delete clips / redo STT** on that recording, then Prepare. Existing old transcripts are not automatically retranscribed when switching STT models.
 
