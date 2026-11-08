@@ -37,7 +37,7 @@ class ScalingMediaTests(unittest.TestCase):
             self.assertTrue(source.exists())
             from app import app
             (root / 'samples').mkdir()
-            with patch('app.DATA', root), patch('studio.storage.DATA', root), patch('app.busy', return_value=False):
+            with patch('app.DATA', root), patch('studio.storage.DATA', root), patch('studio.locking.DATA', root), patch('app.busy', return_value=False):
                 with source.open('rb') as stream:
                     response = app.test_client().post('/api/upload', data={'file': (stream, 'movie.MP4')},
                                                       headers={'X-Studio': 'local'})
