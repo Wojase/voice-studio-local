@@ -12,30 +12,36 @@ bash scripts/server.sh restart
 
 The controller runs in the background, listens on `0.0.0.0:7860`, enables external Host headers for your Vast.ai tunnel, selects English Whisper large-v3 and configures two-GPU training with batch 4 per GPU. Stopping waits for an active job to stop and save. It does not forcibly kill a training process that fails to respond. Forward port **7860** using your Vast.ai tunnel panel.
 
-## Update an existing installation
+## Update an existing installation (one command, Jupyter terminal)
 
-Stop or finish any running job first. Previous copy/paste setup commands changed tracked `app.py` and `web/index.html`; back those changes up in Git's local stash before pulling. No recordings or checkpoints are touched by these Git commands.
-
-```bash
-cd "${STUDIO_WORKSPACE:-$HOME/voice-work}/voice-studio-local"
-git fetch origin
-if ! git diff --quiet; then
-  git stash push -m backup-before-english-srt-update
-fi
-git pull --ff-only
-bash scripts/server.sh restart
-```
-
-Untracked custom launcher files are left in place. Use the new server controller to avoid old launcher settings overriding the defaults. If your environment already defines different settings, set these explicitly before restarting:
+Stops the panel gracefully (a running job saves first), writes a verified backup of models and metadata to
+`~/voice-work/backups`, saves any local modifications from earlier setup snippets as a patch file **and** a Git
+stash (never a hard reset), pulls, updates dependencies and restarts. Untracked custom launchers are left in place.
 
 ```bash
-export STUDIO_HOST=0.0.0.0
-export STUDIO_PUBLIC=1
-export STUDIO_GPUS=2
-export STUDIO_BATCH_SIZE=4
-export STUDIO_STT_MODEL=openai/whisper-large-v3
-bash scripts/server.sh restart
+cd ~/voice-work/voice-studio-local && bash scripts/server.sh stop && T=$(date +%Y%m%d-%H%M%S) && mkdir -p ~/voice-work/backups && STUDIO_BACKUPS=~/voice-work/backups .venv/bin/python -m studio.backup models 2>/dev/null; git diff > ~/voice-work/backups/local-changes-$T.patch; git diff --quiet || git stash push -m "backup-before-update-$T"; git pull --ff-only && .venv/bin/python -m pip install -r requirements.txt && bash scripts/server.sh start
 ```
+
+The old version has no `studio.backup`, so the first update skips that step (`2>/dev/null`). Back up first with
+the `tar` command in the next section. Restore stashed edits with `git stash list` / `git stash apply`.
+
+## Backups to download through Jupyter
+
+```bash
+cd ~/voice-work/voice-studio-local && STUDIO_BACKUPS=~/voice-work/backups .venv/bin/python -m studio.backup all && ls -lh ~/voice-work/backups
+```
+
+Then open the Jupyter file browser at `voice-work/backups/`, tick the `.zip` and `.sha256` files and click
+**Download**. Verify locally with `sha256sum -c *.sha256`. Files left on the rented instance disappear when it is
+destroyed. On a version without `studio.backup`:
+
+```bash
+cd ~/voice-work/voice-studio-local && D="${STUDIO_DATA:-$PWD/data}" && T=$(date +%Y%m%d-%H%M%S) && B=~/voice-work/backups && mkdir -p $B && (cd "$D" && tar -czf $B/voice-models-$T.tar.gz models subtitles jobs $(ls samples/*.json clips/*.json 2>/dev/null)) && (cd "$D" && tar -czf $B/voice-dataset-$T.tar.gz --exclude=trash samples clips features subtitles) && cd $B && sha256sum voice-*-$T.tar.gz > SHA256SUMS-$T.txt && ls -lh
+```
+
+Optional Chatterbox backend: `sudo apt-get install -y python3.11 python3.11-venv` (or use deadsnakes), then
+`bash scripts/setup-chatterbox.sh`. It downloads ~3 GB of packages and, on first generation, 3.2 GB of weights.
+Check `df -h` first.
 
 ## Fresh Ubuntu 24.04 setup
 
@@ -56,20 +62,23 @@ Do not run CLI and panel jobs simultaneously against the same dataset. An OS loc
 
 ```bash
 source .venv/bin/activate
-export STUDIO_STT_MODEL=openai/whisper-large-v3
 python -m studio.importer /path/to/original/audio-or-video
 python -m studio.cli prepare
 # Review transcripts in the panel before training.
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
-  --module studio.cli train --epochs 3 --batch-size 4 --accumulation 2 --lr 0.00005
-CUDA_VISIBLE_DEVICES=0 python -m studio.cli generate --text 'Hello. This is my saved voice.'
+python -m studio.cli create --name "Speaker 1 rank 8"            # prints the experiment ID
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2   --module studio.cli train --experiment ID --epochs 1 --max-updates 20 --batch-size 4 --accumulation 2 --lr 0.00005
+CUDA_VISIBLE_DEVICES=0 python -m studio.cli generate --experiment ID --checkpoint best --text 'Hello. This is my saved voice.'
+python -m studio.cli export --experiment ID --checkpoint best
 ```
 
-Start with batch 4 per GPU and accumulation 2 (effective batch up to 16). Increase batch to 6 or 8 only after measuring memory. With sufficient VRAM, `STUDIO_CHECKPOINTING=0` avoids activation recomputation but increases memory usage. Larger batches or more epochs do not automatically improve voice quality. Both GPUs train; STT, subtitle checks and individual synthesis currently use one GPU.
+Start with batch 4 per GPU and accumulation 2 (effective global batch 16 on two GPUs). Raise the batch only after
+measuring memory. Each card holds its own full model copy. Turning activation checkpointing off is faster but
+uses more memory. Larger batches or more epochs do not automatically improve voice quality. Training uses all
+selected GPUs; STT, subtitle checks and generation use one.
 
 ## Migration and backups
 
-At rest, copy the entire `data` folder into this checkout. Keep all files in `models`, including the reference WAV and split metadata. Do not copy a Windows `.venv` to Linux. Source code is public; audio, subtitle contents, voice checkpoints and Trash are ignored by Git.
+At rest, copy the entire `data` folder into this checkout (or restore the backup zips into it). Keep `experiments`, `datasets.json`, `migrations.json` and the legacy `models` folder. Do not copy a Windows `.venv` to Linux. Source code is public; audio, subtitle contents, voice checkpoints and Trash are ignored by Git.
 
 ```bash
 watch -n 1 nvidia-smi

@@ -34,6 +34,8 @@ def collect(kind, key=''):
         if kind == 'all':
             folders += ['models', 'outputs', 'converted']
         paths = [p for name in folders for p in (DATA / name).glob('*')]
+        if kind == 'all':
+            paths += list((DATA / 'experiments').rglob('*'))
     else:
         raise ValueError('Unknown deletion category.')
     return [p for p in paths if p.is_file()]

@@ -69,7 +69,7 @@ def start():
         if child.poll() is not None:
             raise RuntimeError('Server exited. Read data/panel.log.')
         if status():
-            print('Server ready on port 7860. Open your Vast.ai tunnel URL.')
+            print('Server ready on port 7860. ' + ('Open your Vast.ai tunnel URL.' if rental else 'Open http://127.0.0.1:7860'))
             return
         time.sleep(1)
     raise RuntimeError('Startup timed out. Read data/panel.log.')
@@ -87,7 +87,8 @@ def main():
         current = status()
         summary = {'server': 'offline'} if not current else {
             'server': 'online', 'busy': current['busy'], 'stt': current.get('stt'),
-            'model': current['model'], 'job': {k: current['job'].get(k) for k in ('id', 'action', 'status', 'message')}
+            'experiments': [{k: e.get(k) for k in ('id', 'name', 'status', 'updates', 'best', 'latest')} for e in current.get('experiments', [])],
+            'job': {k: current['job'].get(k) for k in ('id', 'action', 'status', 'message')}
             if current.get('job') else None}
         print(json.dumps(summary, indent=2))
 

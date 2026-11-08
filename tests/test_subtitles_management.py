@@ -24,7 +24,7 @@ class SubtitleTests(unittest.TestCase):
                 sf.write(wav, np.zeros(80000), 16000, format='WAV')
                 raw = wav.getvalue()
                 headers = {'X-Studio': 'local'}
-                with patch('app.DATA', root), patch('studio.management.DATA', root), patch('studio.locking.DATA', root), patch('app.busy', return_value=False):
+                with patch('app.DATA', root), patch('studio.storage.DATA', root), patch('studio.management.DATA', root), patch('studio.locking.DATA', root), patch('app.busy', return_value=False):
                     client = app.test_client()
                     bad = client.post('/api/upload', data={'file': (io.BytesIO(raw), 'voice.wav'),
                         'subtitles': (io.BytesIO(b'invalid'), 'voice.srt'), 'subtitle_mode': mode}, headers=headers)
@@ -69,7 +69,7 @@ class SubtitleTests(unittest.TestCase):
             old = root / 'clips' / (key + '_00000.json')
             write(old, {'text': 'old'})
             headers = {'X-Studio': 'local'}
-            with patch('app.DATA', root), patch('studio.management.DATA', root), patch('studio.locking.DATA', root), patch('app.busy', return_value=False):
+            with patch('app.DATA', root), patch('studio.storage.DATA', root), patch('studio.management.DATA', root), patch('studio.locking.DATA', root), patch('app.busy', return_value=False):
                 client = app.test_client()
                 # Reject malformed SRT before moving any existing clips.
                 response = client.post('/api/subtitles/' + key, data={'file': (io.BytesIO(b'invalid'), 'test.srt')}, headers=headers)

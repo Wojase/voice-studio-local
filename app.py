@@ -11,6 +11,10 @@ import psutil
 from flask import Flask, jsonify, request, send_from_directory
 from studio.storage import ROOT, DATA, read, write, clips
 
+from studio import registry, datasets, config as train_settings, generation
+from studio.backends import BACKENDS
+
+registry.migrate()  # Documented in MIGRATION.md: copies legacy weights into an experiment, never moves them.
 app = Flask(__name__, static_folder='web')
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 ** 3
 lock = threading.Lock()
@@ -65,21 +69,175 @@ def status():
                    subtitles=[read(p) for p in (DATA / 'subtitles').glob('*.json')],
                    converted=[p.name for p in sorted((DATA / 'converted').glob('*.mp3'))],
                    samples=[read(p) for p in sorted((DATA / 'samples').glob('*.json'))],
-                   clips=[read(p) for p in clips()],
+                   clips=clip_rows(),
+                   datasets=datasets.summary(),
+                   experiments=[experiment_summary(e) for e in registry.listing()],
                    outputs=[p.name for p in sorted((DATA / 'outputs').glob('*.wav'), key=lambda p: p.stat().st_mtime, reverse=True)][:20])
+
+
+def clip_rows():
+    if not busy():
+        datasets.analyze(limit=40)  # Bounded per poll; never while a job may be writing clip metadata.
+    rows = [read(p) for p in clips()]
+    for row in rows:
+        row['warnings'] = datasets.warnings(row)
+    return rows
+
+
+def experiment_summary(e):
+    keys = ('id', 'name', 'backend', 'dataset_id', 'speaker', 'status', 'archived', 'updates', 'epochs', 'best', 'latest',
+            'best_validation_loss', 'created', 'updated', 'legacy', 'imported', 'resumable', 'architecture', 'base')
+    return {**{k: e.get(k) for k in keys}, 'checkpoints': e.get('checkpoints', {}), 'config': e.get('config')}
+
+
+def gpu_cards():
+    try:
+        result = subprocess.run(['nvidia-smi', '--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu',
+                                 '--format=csv,noheader,nounits'], capture_output=True, text=True,
+                                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode:
+        return []
+    cards = []
+    for line in result.stdout.splitlines():
+        v = [x.strip() for x in line.split(',')]
+        cards.append(dict(index=int(v[0]), name=v[1], use=int(v[2]), used=int(v[3]), total=int(v[4]), temperature=int(v[5])))
+    return cards
+
+
+@app.get('/api/backends')
+def backends():
+    return jsonify(backends=[b.describe() for b in BACKENDS.values()], training=train_settings.schema(),
+                   evaluation=generation.EVALUATION_SENTENCES, gpus=gpu_cards(), multi_gpu=sys.platform != 'win32',
+                   voices=voices())
+
+
+def voices():
+    try:
+        from studio.backends.kitten import builtin_voices
+        return builtin_voices()
+    except Exception:
+        return []
+
+
+@app.get('/api/history')
+def history():
+    return jsonify(history=generation.history())
+
+
+@app.get('/api/experiments/<experiment_id>')
+def experiment_detail(experiment_id):
+    from studio.storage import read_jsonl
+    experiment = registry.load(experiment_id)
+    folder = registry.root() / experiment_id
+    log_path = folder / 'train.log'
+    log = log_path.read_text(encoding='utf-8')[-20000:] if log_path.exists() else ''
+    split = read(folder / 'split.json', {})
+    return jsonify(experiment=experiment, metrics=read_jsonl(folder / 'metrics.jsonl', limit=20000), log=log,
+                   split={'kind': split.get('kind'), 'recordings': split.get('recordings'),
+                          'note': split.get('note')} if split else None)
+
+
+@app.post('/api/experiments')
+def experiments_create():
+    with lock:
+        body = request.get_json()
+        if body.get('action') == 'duplicate':
+            return jsonify(registry.duplicate(body.get('id', ''), body.get('name')))
+        return jsonify(registry.create(body.get('name', ''), body.get('dataset_id', datasets.DEFAULT_ID),
+                                       body.get('speaker', ''), body.get('config') or {}))
+
+
+@app.post('/api/experiments/<experiment_id>')
+def experiments_update(experiment_id):
+    with lock:
+        body = request.get_json()
+        action = body.get('action')
+        if action == 'rename':
+            return jsonify(registry.rename(experiment_id, body.get('name', '')))
+        if action in ('archive', 'unarchive'):
+            return jsonify(registry.set_archived(experiment_id, action == 'archive'))
+        if action == 'delete':
+            from studio.locking import acquire
+            if busy():
+                return jsonify(error='Stop the current job before deleting experiments.'), 409
+            with acquire():
+                return jsonify(registry.delete(experiment_id, body.get('confirm')))
+        raise ValueError('Unknown experiment action.')
+
+
+@app.get('/api/experiments/<experiment_id>/export')
+def experiment_export(experiment_id):
+    from flask import send_file
+    from studio.export import export
+    path = export(experiment_id, request.args.get('checkpoint', 'best'),
+                  include_reference=request.args.get('reference', '1') == '1')
+    # send_file streams from disk; the archive is never held in memory as a whole.
+    return send_file(path, as_attachment=True, download_name=path.name, mimetype='application/zip')
+
+
+@app.post('/api/import')
+def import_model():
+    from studio.export import import_archive
+    with lock:
+        upload_file = request.files['file']
+        temp = DATA / 'exports' / (uuid.uuid4().hex + '.import')
+        try:
+            upload_file.save(temp)
+            return jsonify(import_archive(temp, request.form.get('name') or None,
+                                          request.form.get('dataset_id') or None, request.form.get('speaker') or None))
+        finally:
+            temp.unlink(missing_ok=True)
+
+
+@app.post('/api/datasets')
+def datasets_update():
+    with lock:
+        if busy():
+            return jsonify(error='Stop the current job before changing datasets.'), 409
+        body = request.get_json()
+        action = body.get('action')
+        if action == 'create':
+            return jsonify(datasets.create(body.get('name'), body.get('speaker')))
+        if action == 'update':
+            return jsonify(datasets.update(body.get('id'), body.get('name'), body.get('add_speaker')))
+        if action == 'assign':
+            ids = body.get('sample_ids') or []
+            if not isinstance(ids, list) or not 1 <= len(ids) <= 1000:
+                raise ValueError('Choose 1-1000 recordings.')
+            return jsonify(datasets.assign(ids, body.get('dataset_id'), body.get('speaker')))
+        raise ValueError('Unknown dataset action.')
+
+
+@app.post('/api/clips/bulk')
+def clips_bulk():
+    from studio.management import safe_key
+    with lock:
+        if busy():
+            return jsonify(error='Stop the current job before editing clips.'), 409
+        body = request.get_json()
+        ids = body.get('ids') or []
+        if not isinstance(ids, list) or not 1 <= len(ids) <= 5000:
+            raise ValueError('Choose 1-5000 clips.')
+        changed = 0
+        for key in ids:
+            path = DATA / 'clips' / (safe_key(key) + '.json')
+            row = read(path)
+            if row:
+                row['enabled'] = bool(body.get('enabled'))
+                if row.get('source') == 'srt':
+                    row['review'] = 'manual'
+                write(path, row)
+                changed += 1
+        return jsonify(changed=changed)
 
 
 @app.get('/api/gpu')
 def gpu():
-    result = subprocess.run(['nvidia-smi', '--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu',
-                             '--format=csv,noheader,nounits'], capture_output=True, text=True,
-                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), timeout=5)
-    if result.returncode:
+    cards = gpu_cards()
+    if not cards:
         return jsonify(error='GPU status is unavailable.'), 503
-    cards = []
-    for line in result.stdout.splitlines():
-        values = [v.strip() for v in line.split(',')]
-        cards.append(dict(name=values[0], use=int(values[1]), used=int(values[2]), total=int(values[3]), temperature=int(values[4])))
     return jsonify(**cards[0], cards=cards)
 
 
@@ -97,7 +255,8 @@ def import_sample(source, original):
         with sf.SoundFile(dest, 'w', samplerate=incoming.samplerate, channels=1, subtype='PCM_16') as out:
             for block in incoming.blocks(blocksize=65536, dtype='float32', always_2d=True):
                 out.write(block.mean(axis=1))
-        data = {'id': digest, 'name': original, 'seconds': incoming.frames / incoming.samplerate}
+        data = {'id': digest, 'name': original, 'seconds': incoming.frames / incoming.samplerate,
+                'sample_rate': incoming.samplerate}
     write(meta, data)
     return data
 
@@ -146,7 +305,12 @@ def upload():
                     sample_id = hashlib.file_digest(stream, 'sha256').hexdigest()[:24]
                 if not (DATA / 'samples' / (sample_id + '.json')).exists():
                     new_sample = sample_id
+                dataset_id = request.form.get('dataset_id') or datasets.DEFAULT_ID
+                dataset = datasets.find(dataset_id)
+                speaker = request.form.get('speaker') or dataset['speakers'][0]
                 result = import_sample(source, Path(file.filename).name)
+                if new_sample or 'dataset_id' not in result:
+                    result = datasets.assign([result['id']], dataset_id, speaker)[0]
                 if subtitle_file:
                     result['subtitles'] = install_subtitles(result['id'], subtitle_file, trusted=mode == 'use')
                     result['check_requested'] = mode == 'check'
@@ -203,29 +367,49 @@ def start():
             for key in args['sample_ids']:
                 if not (DATA / 'subtitles' / (key + '.json')).exists():
                     raise ValueError('Attach an SRT file to this recording first.')
+        env = dict(os.environ)
+        count = 1
         if action == 'train':
-            args = {'epochs': int(payload.get('epochs', 3)), 'accumulation': int(payload.get('accumulation', 4)),
-                    'lr': float(payload.get('lr', .0001)), 'batch_size': int(payload.get('batch_size', os.environ.get('STUDIO_BATCH_SIZE', '1')))}
-            if not 1 <= args['epochs'] <= 100 or not 1 <= args['accumulation'] <= 32 or not 1e-6 <= args['lr'] <= 1e-3:
-                raise ValueError('Invalid training settings.')
-            if not 1 <= args['batch_size'] <= 32:
-                raise ValueError('Batch size must be between 1 and 32 per GPU.')
+            experiment = registry.load(str(payload.get('experiment_id', '')))
+            if not experiment.get('resumable', True):
+                raise ValueError('Imported experiments are inference-only. Duplicate the configuration to train a new one.')
+            fixed = {k: v for k, v in experiment['config'].items() if k in train_settings.FIXED}
+            run = dict(payload.get('run') or {})
+            fixed_sent = [k for k in run if k in train_settings.FIXED and run[k] != experiment['config'].get(k)]
+            if fixed_sent:
+                raise ValueError('Fixed for this experiment: ' + ', '.join(fixed_sent) + '. Duplicate the experiment to change them.')
+            unknown = [k for k in run if k not in train_settings.RESUMABLE and k not in train_settings.FIXED and k != 'lr_preset']
+            if unknown:
+                raise ValueError('Unknown training settings: ' + ', '.join(unknown))
+            run = {k: v for k, v in run.items() if k in train_settings.RESUMABLE or k == 'lr_preset'}
+            cfg = train_settings.validate({**fixed, **run}, gpu_count=len(gpu_cards()) or None,
+                                          distributed_ok=sys.platform != 'win32')
+            args = {'experiment_id': experiment['id'], 'run': {k: cfg[k] for k in train_settings.RESUMABLE}}
+            env['CUDA_VISIBLE_DEVICES'] = ','.join(str(g) for g in cfg['gpus'])
+            count = len(cfg['gpus'])
         if action == 'generate':
-            args['text'] = str(payload.get('text', '')).strip()
-            if not 1 <= len(args['text']) <= 3000:
+            texts = payload.get('texts') or [payload.get('text', '')]
+            if not isinstance(texts, list) or not 1 <= len(texts) <= 20:
+                raise ValueError('Choose 1-20 texts.')
+            texts = [str(t).strip() for t in texts]
+            if any(not 1 <= len(t) <= 3000 for t in texts):
                 raise ValueError('Enter 1-3000 characters.')
+            variants = payload.get('variants') or [{'backend': 'kittentts2-lora', 'kind': 'finetuned',
+                                                    'experiment_id': next((e['id'] for e in registry.listing() if e.get('latest')), '')}]
+            if not isinstance(variants, list) or not 1 <= len(variants) <= 2:
+                raise ValueError('Choose one model, or two for A/B comparison.')
+            args = {'texts': texts, 'variants': [generation.validate_variant(v) for v in variants]}
         active = uuid.uuid4().hex
         write(DATA / 'jobs' / f'{active}.json', {'id': active, 'action': action, 'args': args,
                                                'status': 'running', 'message': 'Starting...', 'progress': 0})
         with open(DATA / 'jobs' / f'{active}.log', 'w', encoding='utf-8') as log:
-            count = int(os.environ.get('STUDIO_GPUS', '1')) if action == 'train' else 1
             command = [sys.executable, '-X', 'utf8', '-m', 'studio.worker', active]
             if count > 1:
                 if sys.platform == 'win32':
                     raise ValueError('Multi-GPU training requires Linux with NCCL.')
                 command = [sys.executable, '-m', 'torch.distributed.run', '--standalone',
                            f'--nproc_per_node={count}', '--module', 'studio.worker', active]
-            process = subprocess.Popen(command, cwd=ROOT,
+            process = subprocess.Popen(command, cwd=ROOT, env=env,
                                        stdout=log, stderr=log, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         return jsonify(id=active)
 
@@ -242,7 +426,7 @@ def stop():
 def audio(kind, name):
     if kind not in ('clips', 'outputs', 'samples', 'converted') or not name.endswith(('.wav', '.mp3')):
         return '', 404
-    return send_from_directory(DATA / kind, name)
+    return send_from_directory(DATA / kind, name, as_attachment=request.args.get('download') == '1')
 
 
 @app.post('/api/manage')
@@ -261,6 +445,14 @@ def manage():
                 return jsonify(deleted=True)
             if body.get('action') == 'restore':
                 return jsonify(management.restore(body.get('key', '')))
+            if body.get('action') == 'restore_many':
+                return jsonify([management.restore(k) for k in body.get('keys', [])])
+            keys = body.get('keys')
+            if isinstance(keys, list) and keys:
+                if len(keys) > 5000:
+                    raise ValueError('Too many items.')
+                paths = [p for k in keys for p in management.collect(body.get('kind'), k)]
+                return jsonify(management.trash(paths, f"{body.get('kind')}: {len(keys)} items"))
             paths = management.collect(body.get('kind'), body.get('key', ''))
             return jsonify(management.trash(paths, body.get('kind') + ': ' + body.get('key', 'all')))
 

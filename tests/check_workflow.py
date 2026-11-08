@@ -1,4 +1,5 @@
-"""Manual integration check. Continues the user's model by one update, then synthesizes."""
+"""Manual integration check against a RUNNING panel. Continues the newest trainable experiment by
+2 updates (bounded), stops, then synthesizes from LATEST through the HTTP API."""
 import time
 import requests
 import soundfile as sf
@@ -9,24 +10,20 @@ HEADERS = {'X-Studio': 'local'}
 
 
 def post(path, body):
-    response = requests.post(URL + path, json=body, headers=HEADERS, timeout=15)
-    response.raise_for_status()
+    response = requests.post(URL + path, json=body, headers=HEADERS, timeout=30)
+    if not response.ok:
+        raise RuntimeError(response.json())
     return response.json()
 
 
-def wait(stop_after=None):
-    deadline = time.monotonic() + 1800
-    message = None
-    stop_sent = False
+def wait():
+    deadline, message = time.monotonic() + 1800, None
     while time.monotonic() < deadline:
         state = requests.get(URL + 'status', timeout=15).json()
         job = state['job']
         if message != job['message']:
             print(job['message'], flush=True)
             message = job['message']
-        if stop_after is not None and job.get('step', 0) >= stop_after and not stop_sent:
-            post('stop', {})
-            stop_sent = True
         if not state['busy']:
             assert job['status'] in ('done', 'stopped'), job
             return state
@@ -34,16 +31,18 @@ def wait(stop_after=None):
     raise TimeoutError('Workflow exceeded 30 minutes')
 
 
-before = requests.get(URL + 'status', timeout=15).json()['model']['steps']
-post('jobs', {'action': 'train', 'epochs': 1, 'accumulation': 1, 'lr': .00005})
-after = wait(stop_after=before + 1)
-assert after['model']['steps'] > before
-print(f"PASS: resume {before} -> {after['model']['steps']}, stop saved", flush=True)
-post('jobs', {'action': 'generate', 'text': 'Hello. This is a test of my local voice model.'})
+experiments = [e for e in requests.get(URL + 'status', timeout=15).json()['experiments'] if e['resumable'] and not e['archived']]
+target = experiments[0]
+before = target['updates']
+post('jobs', {'action': 'train', 'experiment_id': target['id'], 'run': {'epochs': 1, 'max_updates': 2, 'batch_size': 1,
+                                                                       'accumulation': 1, 'lr': 5e-5, 'gpus': target['config']['gpus']}})
+state = wait()
+after = next(e for e in state['experiments'] if e['id'] == target['id'])['updates']
+assert after == before + 2, (before, after)
+print(f"PASS: {target['name']} resumed {before} -> {after}", flush=True)
+post('jobs', {'action': 'generate', 'texts': ['Hello. This is a test of my local voice model.'],
+              'variants': [{'backend': 'kittentts2-lora', 'kind': 'finetuned', 'experiment_id': target['id'], 'checkpoint': 'latest'}]})
 result = wait()
-assert result['model']['steps'] == after['model']['steps'], 'Generation must not train'
-path = DATA / 'outputs' / result['job']['output']
-audio, rate = sf.read(path)
-assert len(audio) > rate
-assert abs(audio).max() > .001
-print(f'PASS: saved-model synthesis, {len(audio)/rate:.2f}s at {rate}Hz -> {path}', flush=True)
+audio, rate = sf.read(DATA / 'outputs' / result['job']['output'])
+assert len(audio) > rate and abs(audio).max() > .001
+print(f'PASS: synthesis from LATEST, {len(audio) / rate:.2f}s at {rate} Hz', flush=True)

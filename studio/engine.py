@@ -55,25 +55,31 @@ def load_model(training=False):
 
 
 class LoRA(nn.Module):
-    def __init__(self, base, rank=8):
+    """Frozen base linear + trainable low-rank residual. Parameter names `a`/`b` match legacy checkpoints."""
+    def __init__(self, base, rank=8, alpha=16.0, dropout=0.0):
         super().__init__()
         self.base = base
         self.a = nn.Parameter(torch.empty(rank, base.in_features, device=base.weight.device))
         self.b = nn.Parameter(torch.zeros(base.out_features, rank, device=base.weight.device))
         nn.init.kaiming_uniform_(self.a, a=math.sqrt(5))
-        self.scale = 2.0
+        self.scale = alpha / rank
+        self.dropout = nn.Dropout(dropout) if dropout else nn.Identity()
 
     def forward(self, x):
-        residual = nn.functional.linear(nn.functional.linear(x.float(), self.a), self.b)
+        residual = nn.functional.linear(nn.functional.linear(self.dropout(x.float()), self.a), self.b)
         return self.base(x) + (residual * self.scale).to(x.dtype)
 
 
-def adapters(model):
+def adapters(model, rank=8, alpha=16.0, dropout=0.0, targets=('q_proj', 'v_proj')):
     model.requires_grad_(False)
+    found = 0
     for name, layer in list(model.named_modules()):
-        if isinstance(layer, nn.Linear) and name.split('.')[-1] in ('q_proj', 'v_proj'):
+        if isinstance(layer, nn.Linear) and name.split('.')[-1] in targets:
             parent, key = name.rsplit('.', 1)
-            setattr(model.get_submodule(parent), key, LoRA(layer))
+            setattr(model.get_submodule(parent), key, LoRA(layer, rank, alpha, dropout))
+            found += 1
+    if not found:
+        raise ValueError('No layers matched the LoRA targets.')
     return {name: p for name, p in model.named_parameters() if p.requires_grad}
 
 
@@ -162,10 +168,12 @@ def check_subtitles(report, stopped, sample_id='', sample_ids=None, **_):
     report('Subtitle check complete. Review flagged clips before training.', progress=1)
 
 
-def features(report, stopped):
+def features(report, stopped, records=None):
+    """Cache base-model codec tokens and speaker embeddings per clip (shared by experiments on this base)."""
     from kittenml.kittentts2.vocoder import S3Codec
     from kittenml.kittentts2.speaker import SpeakerEncoder
-    records = [read(p) for p in clips() if read(p).get('enabled', True)]
+    if records is None:
+        records = [read(p) for p in clips() if read(p).get('enabled', True)]
     if len(records) < 2:
         raise ValueError('At least two enabled clips are required. Aim for 20-60 minutes of clean speech.')
     missing = [r for r in records if not (DATA / 'features' / (r['id'] + '.pt')).exists()]
@@ -187,193 +195,11 @@ def features(report, stopped):
     return records
 
 
-def save_checkpoint(path, value):
-    temp = path.with_suffix('.tmp')
-    torch.save(value, temp)
-    os.replace(temp, path)
+def train(report, stopped, **args):
+    from .backends import kitten
+    return kitten.train(report, stopped, **args)
 
 
-def train(report, stopped, epochs=3, accumulation=4, lr=0.0001, batch_size=1, **_):
-    gpu()
-    torch.manual_seed(42)
-    if parallel.rank() == 0:
-        features(report, stopped)
-    parallel.barrier()
-    records = [read(p) for p in clips() if read(p).get('enabled', True)]
-    if parallel.should_stop(stopped):
-        return
-    torch.manual_seed(42)  # Feature extraction on rank 0 must not change LoRA initialization.
-    report('Loading training model...')
-    tts = load_model(training=True)
-    model = tts.model
-    params = adapters(model)
-    if parallel.world() > 1:
-        for parameter in params.values():
-            torch.distributed.broadcast(parameter.data, src=0)
-    optimizer = torch.optim.AdamW(list(params.values()), lr=lr)
-    scaler = torch.amp.GradScaler('cuda', enabled=False)
-    checkpoint = DATA / 'models' / 'latest.pt'
-    step, completed_epochs, best_loss = 0, 0, float('inf')
-    if checkpoint.exists():
-        previous = torch.load(checkpoint, map_location='cpu', weights_only=True)
-        if previous['base'] != BASE or previous['weights'] != 'emb4' or previous['revision'] != REVISION:
-            raise ValueError('Checkpoint base model does not match.')
-        for name, value in previous['adapter'].items():
-            params[name].data.copy_(value)
-        optimizer.load_state_dict(previous['optimizer'])
-        for group in optimizer.param_groups:
-            group['lr'] = lr
-        scaler.load_state_dict(previous['scaler'])
-        step, completed_epochs = previous['step'], previous['epochs']
-        best_loss = previous.get('best_loss', float('inf'))
-        del previous
-    from kittenml.kittentts2.prompt import build_generation_prompt
-    from kittenml.kittentts2.tokens import TokenMap
-    tm = TokenMap.from_config(tts.config)
-    examples = []
-    embeddings = []
-    for row in records:
-        feature = torch.load(DATA / 'features' / (row['id'] + '.pt'), weights_only=True)
-        prompt = build_generation_prompt(tm, tts.tokenizer.encode(row['text'], add_special_tokens=False))
-        target = [tm.audio_id_base + t for t in feature['tokens']] + [tm.speech_end_id]
-        if len(prompt) + len(target) > 1024:
-            raise ValueError(f"Clip is too long: {row['id']}. Shorten the transcript or disable this clip.")
-        examples.append((prompt, target, feature['embedding']))
-        embeddings.append(feature['embedding'])
-    voice_embedding = torch.stack(embeddings).mean(0)
-    voice_embedding = nn.functional.normalize(voice_embedding, dim=0)
-    reference = DATA / 'models' / 'reference.wav'
-    if not reference.exists():
-        shutil.copyfile(DATA / 'clips' / (records[0]['id'] + '.wav'), reference)
-    # Non-reentrant checkpointing supports frozen embedding inputs and trainable LoRA.
-    if os.environ.get('STUDIO_CHECKPOINTING', '1') == '1':
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
-    model.config.use_cache = False
-    model.train()
-    randomizer = random.Random(42 + step)
-    indices = list(range(len(examples)))
-    random.Random(42).shuffle(indices)
-    holdout = indices[:max(1, len(indices) // 10)] if len(indices) >= 10 else []
-    training = indices[len(holdout):]
-    # Persist memberships so adding recordings does not move old training clips
-    # into validation and produce misleading validation scores.
-    split_path = DATA / 'models' / 'split.json'
-    split = read(split_path, {})
-    if not split:
-        split = {records[i]['id']: ('validation' if i in holdout else 'train') for i in indices}
-    for row in records:
-        if row['id'] not in split:
-            split[row['id']] = 'validation' if int(row['id'][:8], 16) % 10 == 0 else 'train'
-    training = [i for i in indices if split[records[i]['id']] == 'train']
-    holdout = [i for i in indices if split[records[i]['id']] == 'validation']
-    if not training:
-        raise ValueError('Enable at least one training clip.')
-    if parallel.rank() == 0:
-        write(split_path, split)
-
-    def loss_for(batch):
-        selected = [examples[index] for index in batch]
-        length = max(len(p) + len(t) - 1 for p, t, _ in selected)
-        ids = torch.zeros((len(batch), length), dtype=torch.long, device='cuda')
-        mask = torch.zeros_like(ids)
-        labels = torch.full_like(ids, -100)
-        for i, (prompt, target, _) in enumerate(selected):
-            size = len(prompt) + len(target) - 1
-            ids[i, :size] = torch.tensor(prompt + target[:-1], device='cuda')
-            mask[i, :size] = 1
-            labels[i, len(prompt) - 1:size] = torch.tensor(target, device='cuda')
-        # Same speaker conditioning as inference; only predict target audio.
-        with torch.autocast('cuda', dtype=torch.bfloat16):
-            inputs = model.get_input_embeddings()(ids)
-            embeddings_batch = torch.stack([e for _, _, e in selected]).to('cuda', dtype=torch.bfloat16)
-            projected = model.spk_proj(embeddings_batch).unsqueeze(1)
-            inputs = torch.cat([projected, inputs[:, 1:]], dim=1)
-            hidden = model.model(inputs_embeds=inputs, attention_mask=mask, use_cache=False).last_hidden_state
-            valid = labels != -100
-            # Avoid allocating vocabulary logits for text and padding positions.
-            logits = model.lm_head(hidden[valid])
-            return nn.functional.cross_entropy(logits.float(), labels[valid])
-
-    def save(epoch_count):
-        if parallel.rank() != 0:
-            return
-        save_checkpoint(checkpoint, {'base': BASE, 'revision': REVISION, 'weights': 'emb4', 'adapter': {k: v.detach().cpu() for k, v in params.items()},
-                                    'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict(),
-                                    'step': step, 'epochs': epoch_count, 'best_loss': best_loss, 'embedding': voice_embedding,
-                                    'reference_text': records[0]['text']})
-        write(DATA / 'models' / 'info.json', {'steps': step, 'epochs': epoch_count, 'samples': len(records),
-                                            'validation_samples': len(holdout), 'base': BASE})
-
-    for epoch in range(epochs):
-        randomizer.shuffle(training)
-        for offset, batches in parallel.groups(training, accumulation, batch_size, parallel.rank(), parallel.world()):
-            if parallel.should_stop(stopped):
-                save(completed_epochs + epoch)
-                return
-            optimizer.zero_grad(set_to_none=True)
-            total = 0.
-            for micro, batch in enumerate(batches):
-                report(f'Epoch {epoch + 1}/{epochs} · batch {offset + micro + 1}/{len(training)} · saved steps {step}',
-                       progress=(epoch + (offset + micro) / len(training)) / epochs)
-                loss = loss_for(batch)
-                if not torch.isfinite(loss):
-                    raise RuntimeError('Training became unstable. The last completed checkpoint is preserved.')
-                total += loss.item()
-                scaler.scale(loss / len(batches)).backward()
-            scaler.unscale_(optimizer)
-            parallel.synchronize(params.values())
-            torch.nn.utils.clip_grad_norm_(list(params.values()), 1.0, error_if_nonfinite=True)
-            old_scale = scaler.get_scale()
-            scaler.step(optimizer)
-            scaler.update()
-            if scaler.get_scale() >= old_scale:
-                step += 1
-            report(f'Epoch {epoch + 1}/{epochs} · step {step} · loss {total / len(batches):.4f} · GPU {parallel.world()}',
-                   progress=(epoch + min(1, (offset + accumulation * batch_size * parallel.world()) / len(training))) / epochs,
-                   loss=total / len(batches), step=step)
-            if step and step % 25 == 0:
-                save(completed_epochs + epoch)
-        save(completed_epochs + epoch + 1)
-        if holdout and parallel.rank() == 0:
-            model.eval()
-            with torch.no_grad():
-                validation = sum(loss_for([i]).item() for i in holdout) / len(holdout)
-            report(f'Validation after epoch {epoch + 1}: {validation:.4f}', validation_loss=validation)
-            if math.isfinite(validation) and validation < best_loss:
-                best_loss = validation
-                save(completed_epochs + epoch + 1)
-                temp_best = DATA / 'models' / 'best.tmp'
-                shutil.copyfile(checkpoint, temp_best)
-                os.replace(temp_best, DATA / 'models' / 'best.pt')
-            model.train()
-        parallel.barrier()
-    report('Model saved. Generate speech or continue training later.', progress=1)
-
-
-def generate(report, stopped, text='', **_):
-    gpu()
-    checkpoint = DATA / 'models' / 'latest.pt'
-    if not checkpoint.exists():
-        raise ValueError('Train a model first.')
-    report('Loading saved model...')
-    tts = load_model()
-    params = adapters(tts.model)
-    saved = torch.load(checkpoint, map_location='cpu', weights_only=True)
-    for name, value in saved['adapter'].items():
-        params[name].data.copy_(value)
-    tts.model.eval()
-    tts.voices['local'] = {}
-    ref = tts._build_reference(saved['embedding'].numpy(), [], saved['reference_text'],
-                               str(DATA / 'models' / 'reference.wav'))
-    tts._reference_cache[('voice', 'local')] = ref
-    del saved
-    if stopped():
-        return
-    report('Generating speech on GPU...')
-    audio = tts.generate(text, voice='local', use_reference_prompt=False, max_new_tokens=1000)
-    if audio is None or len(audio) == 0 or not np.isfinite(audio).all():
-        raise RuntimeError('The model did not generate valid audio.')
-    import uuid
-    name = f'{uuid.uuid4().hex[:12]}.wav'
-    sf.write(DATA / 'outputs' / name, audio, tts.sample_rate)
-    report('Audio is ready.', progress=1, output=name)
+def generate(report, stopped, **args):
+    from . import generation
+    return generation.run(report, stopped, **args)

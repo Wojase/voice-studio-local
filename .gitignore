@@ -20,3 +20,8 @@ input/
 *.zip
 *.srt
 *.vtt
+.venv-chatterbox/
+*.partial
+*.import
+voice-studio-backups/
+backups/
