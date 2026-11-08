@@ -1,0 +1,6 @@
+kittenml==0.9.4
+flask==3.1.3
+waitress==3.0.2
+psutil==7.2.2
+soundfile==0.14.0
+# Zachowaj istniejący PyTorch CUDA w .venv; nie instaluj wariantu CPU.
