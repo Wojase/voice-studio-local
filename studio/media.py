@@ -37,7 +37,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     source = args.source.resolve()
-    files = sorted(source.rglob('*.mp4')) if source.is_dir() else [source]
+    files = sorted(p for p in source.rglob('*') if p.suffix.lower() == '.mp4') if source.is_dir() else [source]
     failures = 0
     for file in files:
         relative = file.relative_to(source) if source.is_dir() else Path(file.name)

@@ -2,6 +2,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 import soundfile as sf
 from studio.distributed import groups
@@ -34,3 +35,12 @@ class ScalingMediaTests(unittest.TestCase):
                 convert(source, mp3, mp3=True)
             self.assertEqual(mp3.read_bytes(), before)
             self.assertTrue(source.exists())
+            from app import app
+            (root / 'samples').mkdir()
+            with patch('app.DATA', root), patch('app.busy', return_value=False):
+                with source.open('rb') as stream:
+                    response = app.test_client().post('/api/upload', data={'file': (stream, 'movie.MP4')},
+                                                      headers={'X-Studio': 'local'})
+                self.assertEqual(response.status_code, 200, response.get_json())
+                self.assertEqual(len(list((root / 'converted').glob('*.mp3'))), 1)
+                self.assertEqual(len(list((root / 'samples').glob('*.wav'))), 1)

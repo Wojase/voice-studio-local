@@ -32,6 +32,8 @@ def should_stop(stopped):
 
 def synchronize(parameters):
     # Fuse small LoRA gradients into a single collective per update.
+    if world() == 1:
+        return
     parameters = list(parameters)
     flat = torch.cat([p.grad.reshape(-1) for p in parameters])
     if world() > 1:
